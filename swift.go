@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
+
+	"golang.org/x/time/rate"
 
 	ds "github.com/ipfs/go-datastore"
 	dsq "github.com/ipfs/go-datastore/query"
@@ -14,8 +17,9 @@ import (
 )
 
 type SwiftContainer struct {
-	conn  *swift.Connection
-	cache *QueryCache
+	conn    *swift.Connection
+	cache   *QueryCache
+	limiter *rate.Limiter
 
 	Config
 }
@@ -50,10 +54,12 @@ func NewSwiftDatastore(conf Config) (*SwiftContainer, error) {
 		return nil, err
 	}
 
+	l := rate.NewLimiter(rate.Every(time.Second/40), 20)
 	return &SwiftContainer{
-		conn:   c,
-		cache:  &QueryCache{},
-		Config: conf,
+		conn:    c,
+		cache:   &QueryCache{},
+		limiter: l,
+		Config:  conf,
 	}, nil
 }
 
@@ -63,7 +69,13 @@ func keyToName(k ds.Key) string {
 	return strings.TrimPrefix(k.String(), "/")
 }
 
+func (s *SwiftContainer) reserve() {
+	r := s.limiter.Reserve()
+	time.Sleep(r.Delay())
+}
+
 func (s *SwiftContainer) Get(k ds.Key) ([]byte, error) {
+	s.reserve()
 	data, err := s.conn.ObjectGetBytes(s.Container, keyToName(k))
 	switch err {
 	case nil:
@@ -76,16 +88,19 @@ func (s *SwiftContainer) Get(k ds.Key) ([]byte, error) {
 }
 
 func (s *SwiftContainer) Delete(k ds.Key) error {
+	s.reserve()
 	s.cache.Invalidate()
 	return s.conn.ObjectDelete(s.Container, keyToName(k))
 }
 
 func (s *SwiftContainer) Put(k ds.Key, val []byte) error {
+	s.reserve()
 	s.cache.Invalidate()
 	return s.conn.ObjectPutBytes(s.Container, keyToName(k), val, "application/octet-stream")
 }
 
 func (s *SwiftContainer) Has(k ds.Key) (bool, error) {
+	s.reserve()
 	_, _, err := s.conn.Object(s.Container, keyToName(k))
 	switch err {
 	case nil:
@@ -98,6 +113,7 @@ func (s *SwiftContainer) Has(k ds.Key) (bool, error) {
 }
 
 func (s *SwiftContainer) GetSize(k ds.Key) (int, error) {
+	s.reserve()
 	info, _, err := s.conn.Object(s.Container, keyToName(k))
 
 	if err != nil {
@@ -121,6 +137,7 @@ func (s *SwiftContainer) Query(q dsq.Query) (dsq.Results, error) {
 		return nil, fmt.Errorf("swiftds doesnt support filters or orders")
 	}
 
+	s.reserve()
 	opts := swift.ObjectsOpts{
 		Prefix: strings.TrimPrefix(q.Prefix, "/"),
 		// Number of entries to fetch at once
@@ -162,6 +179,7 @@ func (s *SwiftContainer) Query(q dsq.Query) (dsq.Results, error) {
 					return dsq.Result{}, false
 				}
 
+				s.reserve()
 				newNames, err := s.conn.ObjectNames(s.Container, &opts)
 				if err != nil {
 					return dsq.Result{Error: err}, false
@@ -232,6 +250,7 @@ func (s *SwiftContainer) Close() error {
 }
 
 func (s *SwiftContainer) DiskUsage() (uint64, error) {
+	s.reserve()
 	c, _, err := s.conn.Container(s.Container)
 	if err != nil {
 		return 0, err
@@ -281,6 +300,8 @@ func (b *swiftBatch) Delete(k ds.Key) error {
 }
 
 func (b *swiftBatch) Commit() error {
+	b.s.reserve()
+
 	b.s.cache.Invalidate()
 
 	if b.tarWriter != nil {
